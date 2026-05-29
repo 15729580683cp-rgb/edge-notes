@@ -1,0 +1,1607 @@
+可以。那这个项目就不要设计成“普通 textarea 便签”，而应该设计成：
+
+> **Windows 顶部隐藏式 Markdown 素材便签抽屉**
+
+核心能力是：
+
+```text
+鼠标靠近屏幕顶部 → 展开抽屉
+在抽屉里写 Markdown
+可以粘贴图片 / 拖拽图片 / 从本地添加图片
+内容和图片都保存在本地
+再次打开时完整恢复
+```
+
+技术上我建议用：
+
+```text
+Tauri v2 + React + TypeScript + TailwindCSS + Milkdown/Crepe + SQLite + 本地图片目录
+```
+
+Tauri 负责窗口、文件、SQLite、系统能力；React 负责 UI；Milkdown/Crepe 负责 Markdown 编辑器；SQLite 存便签元数据和 Markdown 内容；图片复制到应用数据目录保存。Tauri v2 有官方文件系统插件、Dialog 插件和 SQL 插件，适合这个结构；Milkdown 的 Crepe 编辑器本身支持更完整的 Markdown/WYSIWYG 编辑体验，并包含图片块、图片上传管理、调整尺寸、caption 等能力。([Tauri][1])
+
+---
+
+# 1. 总体架构
+
+整体分成 5 层：
+
+```text
+┌─────────────────────────────────────┐
+│ React UI 层                          │
+│ NotchHandle / DrawerPanel / Editor  │
+└─────────────────────────────────────┘
+                  ↓
+┌─────────────────────────────────────┐
+│ 编辑器层                             │
+│ Milkdown / Crepe Markdown Editor    │
+└─────────────────────────────────────┘
+                  ↓
+┌─────────────────────────────────────┐
+│ 状态管理层                           │
+│ useDrawer / useNotes / useAssets    │
+└─────────────────────────────────────┘
+                  ↓
+┌─────────────────────────────────────┐
+│ Tauri API 层                         │
+│ window / fs / dialog / sql / command│
+└─────────────────────────────────────┘
+                  ↓
+┌─────────────────────────────────────┐
+│ 本地数据层                           │
+│ SQLite + appData/images             │
+└─────────────────────────────────────┘
+```
+
+你要避免把图片直接存进 SQLite。正确做法是：
+
+```text
+SQLite 只保存图片路径 / 资源 ID
+图片文件实际保存到本地 images 目录
+Markdown 内容中引用 app://asset/xxx 或本地资源路径
+```
+
+---
+
+# 2. 核心数据模型
+
+## notes 表
+
+```sql
+CREATE TABLE notes (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  excerpt TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  deleted INTEGER NOT NULL DEFAULT 0
+);
+```
+
+说明：
+
+```text
+id：便签唯一 ID
+title：标题，默认取 Markdown 第一行
+content：完整 Markdown 内容
+excerpt：摘要，用于列表展示
+created_at：创建时间
+updated_at：更新时间
+pinned：是否置顶
+deleted：软删除
+```
+
+---
+
+## assets 表
+
+```sql
+CREATE TABLE assets (
+  id TEXT PRIMARY KEY,
+  note_id TEXT,
+  type TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY(note_id) REFERENCES notes(id)
+);
+```
+
+说明：
+
+```text
+assets 用来管理图片资源
+每张图片都有独立 ID
+图片文件存在本地目录
+Markdown 内容里通过 asset id 或相对路径引用图片
+```
+
+---
+
+## tags 表，可选
+
+```sql
+CREATE TABLE tags (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
+```
+
+```sql
+CREATE TABLE note_tags (
+  note_id TEXT NOT NULL,
+  tag_id TEXT NOT NULL,
+  PRIMARY KEY(note_id, tag_id)
+);
+```
+
+标签不是第一优先级，但可以预留。
+
+---
+
+# 3. 本地文件结构
+
+你的软件在 Windows 上应该把数据放到应用数据目录，而不是项目目录。
+
+结构：
+
+```text
+EdgeNotesData/
+├── database/
+│   └── edge-notes.db
+├── assets/
+│   ├── images/
+│   │   ├── 2026/
+│   │   │   ├── 05/
+│   │   │   │   ├── image_xxx.png
+│   │   │   │   └── image_yyy.jpg
+│   └── thumbnails/
+├── exports/
+└── settings.json
+```
+
+图片不要全部扔一个文件夹，否则后期会乱。按年月分目录：
+
+```text
+assets/images/2026/05/uuid.png
+```
+
+---
+
+# 4. Markdown 内容中的图片引用方式
+
+我建议内部 Markdown 使用这种格式：
+
+```md
+![图片](asset://image_01HXABC.png)
+```
+
+或者：
+
+```md
+![图片](edgenotes://asset/asset_id)
+```
+
+但浏览器/编辑器无法直接显示这种协议，所以渲染时需要转换。
+
+实际保存：
+
+```md
+今天的灵感：
+
+![截图](edgenotes://asset/01JXXX)
+```
+
+前端渲染时转换成：
+
+```text
+http://asset.localhost/xxx
+```
+
+或者 Tauri 的 asset protocol 地址。
+
+更简单的第一版方案是：
+
+```md
+![截图](file:///C:/Users/xxx/AppData/Roaming/EdgeNotes/assets/images/2026/05/xxx.png)
+```
+
+但我不推荐长期用绝对路径，因为迁移和导出会麻烦。
+
+更好的设计是：
+
+```text
+数据库里保存 asset_id → file_path
+Markdown 里保存 edgenotes://asset/asset_id
+编辑器显示时解析成真实可访问地址
+导出时再转换成相对路径
+```
+
+---
+
+# 5. 前端目录结构
+
+建议这样：
+
+```text
+src/
+├── App.tsx
+├── main.tsx
+├── components/
+│   ├── shell/
+│   │   ├── NotchHandle.tsx
+│   │   ├── DrawerPanel.tsx
+│   │   └── WindowFrame.tsx
+│   ├── notes/
+│   │   ├── NoteList.tsx
+│   │   ├── NoteListItem.tsx
+│   │   ├── NoteToolbar.tsx
+│   │   └── SearchBox.tsx
+│   ├── editor/
+│   │   ├── MarkdownEditor.tsx
+│   │   ├── EditorToolbar.tsx
+│   │   ├── ImageInsertButton.tsx
+│   │   └── DropImageOverlay.tsx
+│   └── settings/
+│       └── SettingsPanel.tsx
+│
+├── hooks/
+│   ├── useDrawer.ts
+│   ├── useNotes.ts
+│   ├── useActiveNote.ts
+│   ├── useImageAssets.ts
+│   ├── useDebouncedSave.ts
+│   └── useGlobalShortcut.ts
+│
+├── services/
+│   ├── noteService.ts
+│   ├── assetService.ts
+│   ├── markdownService.ts
+│   ├── databaseService.ts
+│   └── windowService.ts
+│
+├── store/
+│   ├── noteStore.ts
+│   └── uiStore.ts
+│
+├── types/
+│   ├── note.ts
+│   ├── asset.ts
+│   └── editor.ts
+│
+└── styles/
+    └── globals.css
+```
+
+---
+
+# 6. Rust/Tauri 目录结构
+
+```text
+src-tauri/
+├── src/
+│   ├── main.rs
+│   ├── commands/
+│   │   ├── window.rs
+│   │   ├── notes.rs
+│   │   ├── assets.rs
+│   │   └── files.rs
+│   ├── db/
+│   │   ├── mod.rs
+│   │   └── migrations.rs
+│   └── utils/
+│       ├── path.rs
+│       └── image.rs
+├── capabilities/
+│   └── default.json
+├── tauri.conf.json
+└── Cargo.toml
+```
+
+你可以把窗口控制、图片保存、数据库初始化都放到 Rust 侧。前端只负责调用命令。
+
+---
+
+# 7. 窗口核心设计
+
+窗口状态：
+
+```ts
+type DrawerState =
+  | "collapsed"
+  | "expanding"
+  | "expanded"
+  | "editing"
+  | "collapsing";
+```
+
+为什么要有 `editing`？
+
+因为用户正在写 Markdown 时，鼠标可能短暂离开窗口，如果立刻收起，体验会炸。
+
+逻辑：
+
+```text
+collapsed：
+  只显示顶部小标签
+
+expanded：
+  展开便签抽屉
+
+editing：
+  编辑器获得焦点，不自动收起
+
+collapsing：
+  动画收起中
+```
+
+核心规则：
+
+```text
+鼠标进入标签 → expanded
+编辑器 focus → editing
+编辑器 blur + 鼠标离开 → 延迟收起
+按 Esc → collapsed
+按全局快捷键 → expanded / collapsed 切换
+拖拽图片进入 → expanded 并锁定窗口
+```
+
+窗口尺寸：
+
+```ts
+const WINDOW_SIZE = {
+  collapsed: {
+    width: 260,
+    height: 40,
+  },
+  expanded: {
+    width: 860,
+    height: 620,
+  },
+};
+```
+
+位置计算：
+
+```text
+x = 当前屏幕宽度 / 2 - 当前窗口宽度 / 2
+y = 0
+```
+
+Rust 命令：
+
+```rust
+#[tauri::command]
+fn set_window_top_center(app: tauri::AppHandle, width: f64, height: f64) {
+    let window = app.get_webview_window("main").unwrap();
+
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let size = monitor.size();
+        let scale_factor = monitor.scale_factor();
+
+        let monitor_width = size.width as f64 / scale_factor;
+
+        let x = (monitor_width - width) / 2.0;
+        let y = 0.0;
+
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+        let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+    }
+}
+```
+
+前端封装：
+
+```ts
+import { invoke } from "@tauri-apps/api/core";
+
+export async function setTopCenter(width: number, height: number) {
+  return invoke("set_window_top_center", {
+    width,
+    height,
+  });
+}
+```
+
+---
+
+# 8. Markdown 编辑器选择
+
+你有三个选择：
+
+| 编辑器              | 适合度 | 说明                                 |
+| ---------------- | --: | ---------------------------------- |
+| Milkdown / Crepe |   高 | 最适合这个项目，现代、漂亮、插件化、WYSIWYG Markdown |
+| CodeMirror 6     |   中 | 更像源码编辑器，适合程序员                      |
+| TipTap           |  中高 | 很强，但不是原生 Markdown 思维               |
+| Monaco Editor    |   低 | 太重，像 VS Code，不适合便签抽屉               |
+
+我建议直接用：
+
+```text
+Milkdown Crepe
+```
+
+原因：
+
+```text
+支持 Markdown
+界面现代
+支持图片块
+支持 slash command
+可以扩展上传逻辑
+更适合 Notion/Obsidian 风格轻编辑
+```
+
+Milkdown 官方 React 文档提供了 Crepe 这种功能更完整的 WYSIWYG Markdown 编辑器用法；Crepe 本身也有 ImageBlock，支持图片上传、管理、调整大小和 caption。([Milkdown][2])
+
+---
+
+# 9. MarkdownEditor 组件设计
+
+组件职责：
+
+```text
+接收 note.content
+展示 Markdown
+编辑后回传 Markdown
+处理图片粘贴
+处理图片拖拽
+处理图片按钮插入
+```
+
+接口：
+
+```ts
+interface MarkdownEditorProps {
+  noteId: string;
+  value: string;
+  onChange: (markdown: string) => void;
+  onFocus?: () => void;
+  onBlur?: () => void;
+}
+```
+
+组件内部：
+
+```tsx
+export function MarkdownEditor({
+  noteId,
+  value,
+  onChange,
+  onFocus,
+  onBlur,
+}: MarkdownEditorProps) {
+  return (
+    <div
+      className="h-full"
+      onFocus={onFocus}
+      onBlur={onBlur}
+      onPaste={(event) => handlePasteImage(event, noteId, onChange)}
+      onDrop={(event) => handleDropImage(event, noteId, onChange)}
+      onDragOver={(event) => event.preventDefault()}
+    >
+      <CrepeEditor
+        noteId={noteId}
+        value={value}
+        onChange={onChange}
+      />
+    </div>
+  );
+}
+```
+
+这里的 `CrepeEditor` 是你对 Milkdown/Crepe 的二次封装。
+
+---
+
+# 10. 图片添加的三种入口
+
+你应该支持三种方式：
+
+```text
+1. 点击按钮选择图片
+2. 复制图片后 Ctrl + V 粘贴
+3. 拖拽图片到编辑器
+```
+
+这三个入口最后都走同一个函数：
+
+```ts
+saveImageAsset(file, noteId) → Asset
+insertMarkdownImage(asset) → 更新 Markdown
+```
+
+统一服务：
+
+```ts
+export async function insertImageIntoNote(file: File, noteId: string) {
+  const asset = await assetService.saveImage(file, noteId);
+
+  return `![${asset.fileName}](${asset.markdownUrl})`;
+}
+```
+
+---
+
+# 11. 图片服务设计
+
+`assetService.ts`：
+
+```ts
+export interface SavedAsset {
+  id: string;
+  noteId: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  markdownUrl: string;
+  previewUrl: string;
+}
+
+export async function saveImageAsset(
+  file: File,
+  noteId: string
+): Promise<SavedAsset> {
+  const arrayBuffer = await file.arrayBuffer();
+
+  return invoke<SavedAsset>("save_image_asset", {
+    noteId,
+    fileName: file.name,
+    mimeType: file.type,
+    bytes: Array.from(new Uint8Array(arrayBuffer)),
+  });
+}
+```
+
+Rust 命令：
+
+```rust
+#[tauri::command]
+async fn save_image_asset(
+    app: tauri::AppHandle,
+    note_id: String,
+    file_name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+) -> Result<SavedAsset, String> {
+    // 1. 校验 mime_type 是否是 image/*
+    // 2. 生成 asset_id
+    // 3. 生成保存路径
+    // 4. 写入图片文件
+    // 5. 写入 assets 表
+    // 6. 返回 markdownUrl 和 previewUrl
+}
+```
+
+校验逻辑：
+
+```rust
+if !mime_type.starts_with("image/") {
+    return Err("Only image files are supported".into());
+}
+```
+
+文件名生成：
+
+```text
+原始文件名：cat.png
+保存文件名：01JXXX_cat.png
+```
+
+或者更干净：
+
+```text
+01JXXX.png
+```
+
+扩展名从 MIME 推断：
+
+```text
+image/png  → png
+image/jpeg → jpg
+image/webp → webp
+image/gif  → gif
+```
+
+---
+
+# 12. 图片粘贴逻辑
+
+前端处理：
+
+```ts
+export async function handlePasteImage(
+  event: React.ClipboardEvent,
+  noteId: string,
+  insertMarkdown: (markdown: string) => void
+) {
+  const items = Array.from(event.clipboardData.items);
+
+  const imageItem = items.find((item) => item.type.startsWith("image/"));
+
+  if (!imageItem) {
+    return;
+  }
+
+  event.preventDefault();
+
+  const file = imageItem.getAsFile();
+
+  if (!file) {
+    return;
+  }
+
+  const asset = await saveImageAsset(file, noteId);
+
+  insertMarkdown(`\n![${asset.fileName}](${asset.markdownUrl})\n`);
+}
+```
+
+注意：粘贴图片时，很多截图工具给的文件名为空。你要自动生成：
+
+```text
+pasted-20260529-153012.png
+```
+
+---
+
+# 13. 拖拽图片逻辑
+
+```ts
+export async function handleDropImage(
+  event: React.DragEvent,
+  noteId: string,
+  insertMarkdown: (markdown: string) => void
+) {
+  event.preventDefault();
+
+  const files = Array.from(event.dataTransfer.files);
+
+  const images = files.filter((file) => file.type.startsWith("image/"));
+
+  for (const image of images) {
+    const asset = await saveImageAsset(image, noteId);
+
+    insertMarkdown(`\n![${asset.fileName}](${asset.markdownUrl})\n`);
+  }
+}
+```
+
+拖拽时 UI 应显示遮罩：
+
+```text
+松开以添加图片
+```
+
+---
+
+# 14. 点击按钮添加图片
+
+Tauri Dialog 插件可以打开文件选择对话框，返回用户选择的路径；官方文档说明，Dialog 的 `open()` 可打开文件/目录选择器，并且被选择的路径会自动加入文件系统与 asset protocol 的作用域。([Tauri][3])
+
+前端：
+
+```ts
+import { open } from "@tauri-apps/plugin-dialog";
+
+export async function chooseImageFiles() {
+  const selected = await open({
+    multiple: true,
+    filters: [
+      {
+        name: "Images",
+        extensions: ["png", "jpg", "jpeg", "webp", "gif"],
+      },
+    ],
+  });
+
+  return selected;
+}
+```
+
+但是这里有个关键设计点：
+
+```text
+不要直接引用用户原文件路径
+而是复制一份到你的 appData/assets/images 目录
+```
+
+原因：
+
+```text
+用户可能删除原图
+用户可能移动原图
+权限可能变化
+导出/迁移会困难
+```
+
+所以你需要 Rust 命令：
+
+```rust
+#[tauri::command]
+async fn import_image_from_path(
+    app: tauri::AppHandle,
+    note_id: String,
+    source_path: String,
+) -> Result<SavedAsset, String> {
+    // 1. 读取 source_path
+    // 2. 判断是否图片
+    // 3. 复制到 appData/assets/images/yyyy/mm/
+    // 4. 写 assets 表
+    // 5. 返回 markdownUrl
+}
+```
+
+---
+
+# 15. Markdown 图片插入策略
+
+不要直接操作 DOM。你应该让编辑器层暴露一个命令：
+
+```ts
+editor.insertMarkdown(markdown)
+```
+
+如果 Milkdown/Crepe 可以通过 command 插入内容，你就调用编辑器 command。
+如果早期你封装不熟，可以先用一个简单策略：
+
+```text
+保存当前 Markdown 字符串
+在末尾追加图片 Markdown
+调用 setContent
+```
+
+简单版：
+
+```ts
+function appendMarkdownImage(markdown: string) {
+  onChange(value + "\n" + markdown + "\n");
+}
+```
+
+高级版：
+
+```text
+插入到当前光标位置
+```
+
+这个后面再做。你的架构里要预留：
+
+```ts
+insertAtCursor(markdown: string)
+```
+
+---
+
+# 16. NoteService 设计
+
+`noteService.ts`：
+
+```ts
+export async function listNotes(): Promise<Note[]> {
+  return invoke("list_notes");
+}
+
+export async function getNote(id: string): Promise<Note> {
+  return invoke("get_note", { id });
+}
+
+export async function createNote(): Promise<Note> {
+  return invoke("create_note");
+}
+
+export async function updateNote(id: string, content: string): Promise<void> {
+  return invoke("update_note", {
+    id,
+    content,
+  });
+}
+
+export async function deleteNote(id: string): Promise<void> {
+  return invoke("delete_note", {
+    id,
+  });
+}
+
+export async function searchNotes(keyword: string): Promise<Note[]> {
+  return invoke("search_notes", {
+    keyword,
+  });
+}
+```
+
+---
+
+# 17. 自动保存设计
+
+Markdown 编辑器会频繁触发 `onChange`，不能每次都写 SQLite。
+
+要做防抖：
+
+```ts
+export function useDebouncedSave(
+  noteId: string,
+  content: string,
+  delay = 600
+) {
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      noteService.updateNote(noteId, content);
+    }, delay);
+
+    return () => window.clearTimeout(timer);
+  }, [noteId, content, delay]);
+}
+```
+
+更完整一点：
+
+```text
+用户正在输入：状态显示 “正在编辑”
+600ms 无输入：保存到 SQLite
+保存成功：状态显示 “已保存”
+保存失败：状态显示 “保存失败”
+```
+
+状态：
+
+```ts
+type SaveStatus =
+  | "idle"
+  | "editing"
+  | "saving"
+  | "saved"
+  | "error";
+```
+
+UI 放在编辑器右上角：
+
+```text
+已保存
+```
+
+---
+
+# 18. Markdown 标题提取
+
+更新内容时自动生成标题。
+
+规则：
+
+```ts
+export function extractTitle(markdown: string): string {
+  const lines = markdown
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return "未命名便签";
+  }
+
+  const first = lines[0];
+
+  return first
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^[-*+]\s+/, "")
+    .replace(/!\[.*?\]\(.*?\)/g, "[图片]")
+    .slice(0, 60);
+}
+```
+
+摘要提取：
+
+```ts
+export function extractExcerpt(markdown: string): string {
+  return markdown
+    .replace(/!\[.*?\]\(.*?\)/g, "[图片]")
+    .replace(/[#>*_`~\-]/g, "")
+    .replace(/\n+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+```
+
+---
+
+# 19. 搜索设计
+
+基础搜索：
+
+```sql
+SELECT * FROM notes
+WHERE deleted = 0
+AND (
+  title LIKE ?
+  OR content LIKE ?
+)
+ORDER BY pinned DESC, updated_at DESC;
+```
+
+后期可以升级 SQLite FTS5：
+
+```sql
+CREATE VIRTUAL TABLE notes_fts USING fts5(
+  title,
+  content,
+  content='notes',
+  content_rowid='rowid'
+);
+```
+
+但第一版普通 LIKE 就够。
+
+---
+
+# 20. 编辑器 UI 设计
+
+展开面板结构：
+
+```text
+┌──────────────────────────────────────────────┐
+│ 顶部栏：搜索 / 新建 / 图片 / 设置 / 保存状态 │
+├───────────────┬──────────────────────────────┤
+│ 便签列表       │ Markdown 编辑区              │
+│               │                              │
+│ 最近           │ # 标题                       │
+│ 置顶           │ 正文                         │
+│ 搜索结果       │ 图片                         │
+└───────────────┴──────────────────────────────┘
+```
+
+组件：
+
+```tsx
+<DrawerPanel>
+  <Sidebar>
+    <SearchBox />
+    <CreateNoteButton />
+    <NoteList />
+  </Sidebar>
+
+  <EditorArea>
+    <EditorToolbar>
+      <ImageInsertButton />
+      <SaveStatus />
+      <PinButton />
+      <DeleteButton />
+    </EditorToolbar>
+
+    <MarkdownEditor />
+  </EditorArea>
+</DrawerPanel>
+```
+
+---
+
+# 21. 图片按钮工具栏
+
+```tsx
+export function EditorToolbar({
+  onInsertImage,
+  saveStatus,
+}: {
+  onInsertImage: () => void;
+  saveStatus: SaveStatus;
+}) {
+  return (
+    <div className="h-11 border-b border-white/10 flex items-center justify-between px-3">
+      <div className="flex items-center gap-2">
+        <button
+          onClick={onInsertImage}
+          className="h-8 px-3 rounded-lg bg-white/10 hover:bg-white/15 text-sm"
+        >
+          添加图片
+        </button>
+
+        <button className="h-8 px-3 rounded-lg bg-white/10 hover:bg-white/15 text-sm">
+          预览
+        </button>
+      </div>
+
+      <div className="text-xs text-zinc-500">
+        {saveStatus === "saving" && "保存中..."}
+        {saveStatus === "saved" && "已保存"}
+        {saveStatus === "error" && "保存失败"}
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+# 22. Rust 数据库初始化
+
+用 SQLite 时，你可以用 Tauri SQL 插件，也可以自己在 Rust 侧用 rusqlite。
+如果你想逻辑更可控，我建议 Rust 侧自己管理 SQLite。
+如果你想更快开发，可以用 Tauri SQL 插件。官方 SQL 插件支持 SQLite/MySQL/PostgreSQL，通过前端和 SQL 数据库通信。([Tauri][4])
+
+我更推荐：
+
+```text
+Rust 管 SQLite
+前端只调用 invoke
+```
+
+因为图片保存和数据库记录要组成一个事务逻辑：
+
+```text
+图片写入成功 + assets 表写入成功
+```
+
+不然会出现：
+
+```text
+图片文件存在，但数据库没记录
+数据库有记录，但图片文件没保存
+```
+
+---
+
+# 23. Rust 命令列表
+
+你需要这些命令：
+
+```rust
+#[tauri::command]
+fn set_window_top_center(width: f64, height: f64) -> Result<(), String>;
+
+#[tauri::command]
+fn list_notes() -> Result<Vec<Note>, String>;
+
+#[tauri::command]
+fn get_note(id: String) -> Result<Note, String>;
+
+#[tauri::command]
+fn create_note() -> Result<Note, String>;
+
+#[tauri::command]
+fn update_note(id: String, content: String) -> Result<(), String>;
+
+#[tauri::command]
+fn delete_note(id: String) -> Result<(), String>;
+
+#[tauri::command]
+fn search_notes(keyword: String) -> Result<Vec<Note>, String>;
+
+#[tauri::command]
+fn save_image_asset(
+    note_id: String,
+    file_name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+) -> Result<SavedAsset, String>;
+
+#[tauri::command]
+fn import_image_from_path(
+    note_id: String,
+    source_path: String,
+) -> Result<SavedAsset, String>;
+
+#[tauri::command]
+fn resolve_asset_url(asset_id: String) -> Result<String, String>;
+
+#[tauri::command]
+fn list_assets(note_id: String) -> Result<Vec<Asset>, String>;
+```
+
+---
+
+# 24. 图片保存 Rust 逻辑
+
+伪代码：
+
+```rust
+fn save_image_asset_impl(
+    app: &AppHandle,
+    note_id: String,
+    original_name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+) -> Result<SavedAsset, String> {
+    if !mime_type.starts_with("image/") {
+        return Err("不是图片文件".into());
+    }
+
+    let asset_id = generate_id();
+    let ext = mime_to_ext(&mime_type)?;
+    let now = chrono::Utc::now();
+
+    let relative_path = format!(
+        "assets/images/{}/{}/{}.{}",
+        now.format("%Y"),
+        now.format("%m"),
+        asset_id,
+        ext
+    );
+
+    let full_path = app_data_dir.join(&relative_path);
+
+    create_dir_all(parent_dir)?;
+    write(&full_path, bytes)?;
+
+    insert_asset_to_db(
+        asset_id,
+        note_id,
+        original_name,
+        relative_path,
+        mime_type,
+        size,
+    )?;
+
+    Ok(SavedAsset {
+        id: asset_id.clone(),
+        file_name: original_name,
+        markdown_url: format!("edgenotes://asset/{}", asset_id),
+        preview_url: make_preview_url(asset_id),
+    })
+}
+```
+
+---
+
+# 25. 图片预览 URL 方案
+
+你有两个方案：
+
+## 方案 A：使用 Tauri asset protocol
+
+优点：
+
+```text
+更贴近 Tauri 官方能力
+前端 img src 可以访问本地文件
+```
+
+缺点：
+
+```text
+需要处理权限和路径作用域
+```
+
+Tauri 的文件系统插件支持 base directory 和 path API；Dialog 插件选中的路径也会加入文件系统与 asset protocol scope。([Tauri][1])
+
+---
+
+## 方案 B：Rust 提供 base64
+
+```rust
+#[tauri::command]
+fn read_asset_base64(asset_id: String) -> Result<String, String>
+```
+
+返回：
+
+```text
+data:image/png;base64,xxxx
+```
+
+优点：
+
+```text
+最简单
+```
+
+缺点：
+
+```text
+大图多了会占内存
+```
+
+不推荐长期使用。
+
+---
+
+## 方案 C：自定义协议
+
+```text
+edgenotes://asset/asset_id
+```
+
+然后注册自定义协议，将 asset_id 映射到真实文件。
+
+这是最优雅的长期方案。
+
+第一版可以先用 Tauri asset URL 或绝对路径显示，架构里保留 `resolveAssetUrl`，后期换协议时前端不用大改。
+
+---
+
+# 26. Markdown 加载与保存的转换
+
+因为你的 Markdown 内部可能是：
+
+```md
+![截图](edgenotes://asset/01JXXX)
+```
+
+但编辑器展示需要真实图片地址。
+
+所以要有两个转换函数：
+
+```ts
+export async function markdownToEditorMarkdown(markdown: string) {
+  // edgenotes://asset/id
+  // ↓
+  // 可显示的图片 URL
+}
+
+export async function editorMarkdownToStorageMarkdown(markdown: string) {
+  // 可显示图片 URL
+  // ↓
+  // edgenotes://asset/id
+}
+```
+
+例子：
+
+```ts
+export async function markdownToEditorMarkdown(markdown: string) {
+  const assetPattern = /edgenotes:\/\/asset\/([a-zA-Z0-9_-]+)/g;
+
+  let result = markdown;
+  const matches = [...markdown.matchAll(assetPattern)];
+
+  for (const match of matches) {
+    const assetId = match[1];
+    const previewUrl = await assetService.resolveAssetUrl(assetId);
+
+    result = result.replace(match[0], previewUrl);
+  }
+
+  return result;
+}
+```
+
+保存前反向转换：
+
+```ts
+export function editorMarkdownToStorageMarkdown(markdown: string) {
+  // 将 app asset URL 还原成 edgenotes://asset/id
+}
+```
+
+---
+
+# 27. 图片删除与垃圾回收
+
+用户删除 Markdown 里的图片时，图片文件不会自动删除。
+
+你需要一个资源清理机制：
+
+```text
+保存便签时，扫描 Markdown 中仍在使用的 asset_id
+查询该 note_id 下所有 assets
+不再被引用的 asset 标记为 orphan
+定期清理 orphan 图片
+```
+
+assets 表加字段：
+
+```sql
+ALTER TABLE assets ADD COLUMN orphaned INTEGER NOT NULL DEFAULT 0;
+```
+
+逻辑：
+
+```text
+每次保存 note：
+  usedAssetIds = parseAssetIds(markdown)
+  noteAssets = listAssets(noteId)
+  for asset in noteAssets:
+    if asset.id not in usedAssetIds:
+      mark orphaned = 1
+```
+
+不要立即删除，因为用户可能 Ctrl+Z 撤回。
+
+可以 7 天后清理：
+
+```text
+orphaned = 1 且 updated_at 超过 7 天 → 删除文件 + 删除数据库记录
+```
+
+---
+
+# 28. Markdown 导出设计
+
+后期你可以支持：
+
+```text
+导出为 .md
+导出为文件夹
+导出为 Markdown + images
+```
+
+导出结构：
+
+```text
+MyNote/
+├── note.md
+└── images/
+    ├── 01JXXX.png
+    └── 01JYYY.jpg
+```
+
+导出时把：
+
+```md
+![截图](edgenotes://asset/01JXXX)
+```
+
+转换成：
+
+```md
+![截图](./images/01JXXX.png)
+```
+
+这个设计非常重要，因为它让你的数据不被软件锁死。
+
+---
+
+# 29. 设置项设计
+
+settings 表或 settings.json：
+
+```json
+{
+  "position": "top-center",
+  "collapsedWidth": 260,
+  "collapsedHeight": 40,
+  "expandedWidth": 860,
+  "expandedHeight": 620,
+  "autoCollapseDelay": 500,
+  "theme": "dark",
+  "editorMode": "wysiwyg",
+  "autoStart": false,
+  "shortcut": "Alt+Space"
+}
+```
+
+后期可以支持：
+
+```text
+顶部
+左侧
+右侧
+顶部左
+顶部右
+```
+
+但默认就是：
+
+```text
+top-center
+```
+
+---
+
+# 30. 主 App 状态设计
+
+```ts
+interface AppState {
+  drawerState: DrawerState;
+  notes: NoteSummary[];
+  activeNoteId: string | null;
+  activeNote: Note | null;
+  searchKeyword: string;
+  saveStatus: SaveStatus;
+  dragOver: boolean;
+}
+```
+
+推荐 Zustand：
+
+```bash
+npm install zustand
+```
+
+`noteStore.ts`：
+
+```ts
+interface NoteStore {
+  notes: NoteSummary[];
+  activeNote: Note | null;
+  activeNoteId: string | null;
+  searchKeyword: string;
+  saveStatus: SaveStatus;
+
+  loadNotes: () => Promise<void>;
+  createNote: () => Promise<void>;
+  selectNote: (id: string) => Promise<void>;
+  updateActiveContent: (content: string) => void;
+  saveActiveNote: () => Promise<void>;
+  deleteNote: (id: string) => Promise<void>;
+  searchNotes: (keyword: string) => Promise<void>;
+}
+```
+
+UI 状态单独放：
+
+```ts
+interface UIStore {
+  drawerState: DrawerState;
+  isDraggingImage: boolean;
+  isEditorFocused: boolean;
+
+  expand: () => Promise<void>;
+  collapse: () => Promise<void>;
+  lockEditing: () => void;
+  unlockEditing: () => void;
+}
+```
+
+---
+
+# 31. 核心交互完整流程
+
+## 用户靠近顶部
+
+```text
+mouseenter notch
+→ uiStore.expand()
+→ Rust 设置窗口 860x620 top-center
+→ React 显示 DrawerPanel
+→ 加载最近便签
+```
+
+---
+
+## 用户写 Markdown
+
+```text
+Editor onChange
+→ updateActiveContent(markdown)
+→ saveStatus = editing
+→ debounce 600ms
+→ update_note(id, markdown)
+→ Rust 提取 title/excerpt
+→ SQLite 更新
+→ saveStatus = saved
+```
+
+---
+
+## 用户粘贴图片
+
+```text
+paste event
+→ 检测 clipboard image
+→ saveImageAsset(file, noteId)
+→ Rust 写入 appData/assets/images
+→ Rust 写入 assets 表
+→ 返回 edgenotes://asset/id
+→ 插入 Markdown 图片语法
+→ 触发自动保存
+```
+
+---
+
+## 用户拖入图片
+
+```text
+dragenter
+→ 显示 DropImageOverlay
+drop
+→ 读取 files
+→ 对每个 image 执行 saveImageAsset
+→ 插入多行 Markdown 图片
+→ 自动保存
+```
+
+---
+
+## 用户点击添加图片
+
+```text
+点击 添加图片
+→ dialog.open()
+→ 用户选择图片
+→ importImageFromPath(path, noteId)
+→ 复制图片到 appData
+→ 插入 Markdown 图片
+→ 自动保存
+```
+
+---
+
+# 32. 安全与限制
+
+图片大小限制：
+
+```text
+单张图片最大 10MB
+一次拖拽最多 20 张
+支持 png/jpg/jpeg/webp/gif
+```
+
+原因：
+
+```text
+便签抽屉不是相册软件
+图片太大会拖慢编辑器
+```
+
+Rust 侧必须校验，前端校验不可靠。
+
+```rust
+const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
+
+if bytes.len() > MAX_IMAGE_SIZE {
+    return Err("图片不能超过 10MB".into());
+}
+```
+
+---
+
+# 33. 你最终要写的核心文件
+
+前端：
+
+```text
+src/App.tsx
+src/components/shell/NotchHandle.tsx
+src/components/shell/DrawerPanel.tsx
+src/components/notes/NoteList.tsx
+src/components/notes/NoteListItem.tsx
+src/components/editor/MarkdownEditor.tsx
+src/components/editor/EditorToolbar.tsx
+src/components/editor/DropImageOverlay.tsx
+src/hooks/useDrawer.ts
+src/hooks/useDebouncedSave.ts
+src/services/noteService.ts
+src/services/assetService.ts
+src/services/markdownService.ts
+src/store/noteStore.ts
+src/store/uiStore.ts
+src/types/note.ts
+src/types/asset.ts
+```
+
+后端：
+
+```text
+src-tauri/src/main.rs
+src-tauri/src/commands/window.rs
+src-tauri/src/commands/notes.rs
+src-tauri/src/commands/assets.rs
+src-tauri/src/db/mod.rs
+src-tauri/src/db/migrations.rs
+src-tauri/src/utils/path.rs
+src-tauri/src/utils/image.rs
+```
+
+---
+
+# 34. 最终产品的编码核心
+
+你这个项目最核心的代码不是 Markdown，也不是 SQLite，而是这 4 个闭环：
+
+```text
+窗口闭环：
+collapsed ↔ expanded ↔ editing ↔ collapsed
+
+编辑闭环：
+Markdown 输入 → 防抖保存 → SQLite → 重新加载
+
+图片闭环：
+选择/粘贴/拖拽图片 → 复制到 appData → assets 表 → Markdown 引用 → 编辑器显示
+
+资源闭环：
+Markdown 扫描 asset_id → 判断图片是否仍被使用 → 标记孤儿资源 → 定期清理
+```
+
+只要这 4 个闭环稳定，你这个项目就不是玩具，而是一个真正可长期迭代的软件。
+
+我的最终建议是：**编辑器直接选 Milkdown/Crepe，图片不要进数据库，SQLite 只存 Markdown 和资源索引，所有图片复制到应用数据目录，Markdown 内部用 `edgenotes://asset/id` 引用。** 这个架构后面加导出、同步、AI 总结、标签、搜索都不会推倒重来。
+
+[1]: https://v2.tauri.app/plugin/file-system/?utm_source=chatgpt.com "File System"
+[2]: https://milkdown.dev/docs/recipes/react?utm_source=chatgpt.com "React"
+[3]: https://v2.tauri.app/plugin/dialog/?utm_source=chatgpt.com "Dialog"
+[4]: https://v2.tauri.app/plugin/sql/?utm_source=chatgpt.com "SQL"
