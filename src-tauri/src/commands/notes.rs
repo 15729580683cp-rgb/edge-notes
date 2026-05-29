@@ -201,12 +201,13 @@ fn parse_asset_ids(markdown: &str) -> HashSet<String> {
             .chars()
             .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
             .collect();
+        let id_len = id.len();
 
         if !id.is_empty() {
             ids.insert(id);
         }
 
-        rest = &candidate[id.len()..];
+        rest = &candidate[id_len..];
     }
 
     ids
