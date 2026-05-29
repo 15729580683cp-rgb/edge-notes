@@ -1,6 +1,6 @@
 [package]
 name = "edge-notes"
-version = "0.1.0"
+version = "0.1.1"
 description = "Windows top drawer Markdown notes"
 authors = ["EdgeNotes"]
 edition = "2021"
